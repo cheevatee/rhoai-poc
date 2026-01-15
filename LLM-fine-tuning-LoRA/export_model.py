@@ -6,7 +6,7 @@ import os
 # 1. Paths
 model_path = "./qwen3-base"
 adapter_path = "./final_lora_adapter"
-output_path = "./qwen3-mars-final"  # This is what you will upload to OpenShift
+output_path = "./qwen3-final"  # This is what you will upload to OpenShift
 
 # 2. Load the Base Model
 print("Loading base model...")
