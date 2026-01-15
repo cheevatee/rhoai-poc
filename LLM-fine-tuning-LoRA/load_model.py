@@ -10,4 +10,4 @@ def download_s3_folder(bucket_name, s3_folder, local_dir):
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
         s3.download_file(bucket_name, obj['Key'], local_file_path)
 
-# download_s3_folder('my-model-bucket', 'models/qwen3-0.6b-base/', './qwen3-base')
+download_s3_folder('my-model-bucket', 'models/qwen3-0.6b-base/', './qwen3-base')
