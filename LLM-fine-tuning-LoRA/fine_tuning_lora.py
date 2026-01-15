@@ -19,13 +19,13 @@ model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True
 )
 
-# 1. Configure LoRA
+# 1. Increase LoRA Capacity
 peft_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
-    r=8, 
-    lora_alpha=32,
-    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"], # Expanded targets for better learning
-    lora_dropout=0.1,
+    r=32,           # Increased from 8 to 32 for better memorization
+    lora_alpha=64,  # Usually 2x the Rank
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], 
+    lora_dropout=0.05,
 )
 
 model = get_peft_model(model, peft_config)
@@ -54,19 +54,16 @@ def tokenize_function(examples):
 
 tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset.column_names)
 
-# 3. Train
+# 3. Train with a Scheduler
 args = TrainingArguments(
     output_dir="./qwen3-mars-lora",
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
-#    learning_rate=2e-4,
-#    num_train_epochs=5,
-    learning_rate=5e-5, # Slightly lower learning rate for more stable memorization
-    num_train_epochs=20, # Increase from 5 to 20 for such tiny data
-    save_steps=50,
-    logging_steps=5,
+    per_device_train_batch_size=1, # Use 1 for small datasets to get more updates
+    gradient_accumulation_steps=1,
+    learning_rate=1e-4,            # Middle ground
+    num_train_epochs=40,           # Push it to 40 epochs
+    lr_scheduler_type="constant",  # Don't let the learning rate fade away
     bf16=True,
-    report_to=["none"]  # Fixed: changed 'reporting_to' to 'report_to'
+    report_to=["none"]
 )
 
 trainer = Trainer(
