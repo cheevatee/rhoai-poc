@@ -34,4 +34,8 @@ onnx_model = ORTModelForCausalLM.from_pretrained(
 
 # Save the final ONNX artifacts
 onnx_model.save_pretrained("./onnx_output")
-print("Export complete. Files located in ./onnx_output")
+
+# IMPORTANT: Save the tokenizer into the SAME final directory
+tokenizer.save_pretrained("./onnx_output") 
+
+print("Export complete. All files (including tokenizer) located in ./onnx_output")
