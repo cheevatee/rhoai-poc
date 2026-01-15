@@ -60,11 +60,11 @@ args = TrainingArguments(
     per_device_train_batch_size=4,
     gradient_accumulation_steps=4,
     learning_rate=2e-4,
-    num_train_epochs=5, # Increased epochs slightly for such a small dataset
+    num_train_epochs=5, 
     save_steps=50,
     logging_steps=5,
     bf16=True,
-    reporting_to="none" # Prevents errors if wandb is not installed
+    report_to=["none"]  # Fixed: changed 'reporting_to' to 'report_to'
 )
 
 trainer = Trainer(
