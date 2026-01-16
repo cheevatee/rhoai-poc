@@ -9,4 +9,4 @@ def upload_folder_to_s3(local_dir, bucket_name, s3_folder):
             s3_path = os.path.join(s3_folder, os.path.relpath(local_path, local_dir))
             s3.upload_file(local_path, bucket_name, s3_path)
 
-upload_folder_to_s3("./qwen3-final", "my-model-bucket", "exports/qwen3-mars-onnx/")
+upload_folder_to_s3("./qwen3-final", "my-model-bucket", "exports/qwen3-mars/")
