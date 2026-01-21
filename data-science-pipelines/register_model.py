@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import os, sys, re, subprocess, base64, json
+from typing import Any, Dict, Optional, Tuple, List
 
 def log(m): print(f"[register_model] {m}", flush=True)
 def fatal(m, c=1): print(f"[register_model][ERROR] {m}", flush=True); sys.exit(c)
 
-# model registry route
-REGISTRY_URL = "https://model-registry-rest.apps.ocp.example.com"
+REGISTRY_URL = os.getenv("MODEL_REGISTRY_URL", "https://model-registry-rest.apps.ocp.tl4lg.sandbox782.opentlc.com").rstrip("/")
 
 def env(name, default=None):
     v = os.getenv(name, default)
@@ -34,7 +34,7 @@ def resolve_run_prefix_or_fail() -> str:
     raise RuntimeError("RUN_PREFIX not found")
 
 def resolve_s3_path() -> str:
-    s3_path = os.getenv("S3_PATH", "").strip().rstrip("/")
+    s3_path = os.getenv("S3_PATH", "").strip().strip("/")
     if s3_path:
         return s3_path
     run_prefix = resolve_run_prefix_or_fail()
@@ -65,9 +65,6 @@ def pick_items(data):
     return []
 
 def main():
-    if "<your-model-registry-route>" in REGISTRY_URL:
-        fatal("Please set REGISTRY_URL at top of script to your real Model Registry Route (https://...)")
-
     ensure_pkg("kubernetes", "kubernetes>=28.1.0")
     ensure_pkg("requests", "requests>=2.31.0")
     import requests
@@ -75,9 +72,16 @@ def main():
     namespace  = env("NAMESPACE", "rhoai-model")
     model_name = env("MODEL_NAME", "qwen3-06b-mars")
     version    = env("MODEL_VERSION", resolve_run_prefix_or_fail())
-    bucket     = env("MODEL_BUCKET", "ocp-model-registry") # CHANGE BUCKET NAME
-    s3_path    = resolve_s3_path()
-    model_uri  = env("MODEL_URI", f"s3://{bucket}/{s3_path}/")
+
+    bucket      = env("MODEL_BUCKET", "ocp-qnn9k-model-registry-us-east-2-werohpwyueeilfniqmlecbgxqyb")
+    s3_path     = resolve_s3_path().strip().strip("/")
+    s3_region   = env("MODEL_S3_REGION", env("AWS_REGION", "us-east-2"))
+    s3_endpoint = env("MODEL_S3_ENDPOINT", f"https://s3.{s3_region}.amazonaws.com")
+
+    model_uri = env("MODEL_URI", f"s3://{bucket}/{s3_path}")
+
+    model_format_name = env("MODEL_FORMAT_NAME", "hf-transformers")
+    model_format_ver  = env("MODEL_FORMAT_VERSION", "1")
 
     token = read_registry_token_from_secret(
         namespace,
@@ -85,11 +89,10 @@ def main():
         env("MODEL_REGISTRY_TOKEN_KEY", "token"),
     )
 
-    registry = REGISTRY_URL.rstrip("/")
-    base = f"{registry}/api/model_registry/v1alpha3"
+    base = f"{REGISTRY_URL}/api/model_registry/v1alpha3"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
 
-    def req(method, url, payload=None):
+    def req(method: str, url: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, str, Optional[Dict[str, Any]]]:
         r = requests.request(method, url, headers=headers, json=payload, timeout=60, verify=False)
         data = None
         if r.headers.get("content-type","").startswith("application/json"):
@@ -99,13 +102,15 @@ def main():
                 data = None
         return r.status_code, r.text, data
 
-    log(f"MODEL_REGISTRY_URL(HARDCODED)={registry}")
+    log(f"MODEL_REGISTRY_URL={REGISTRY_URL}")
+    log(f"API_BASE={base}")
     log(f"MODEL_NAME={model_name}")
     log(f"MODEL_VERSION={version}")
     log(f"MODEL_URI={model_uri}")
-    log(f"API_BASE={base}")
+    log(f"S3 endpoint={s3_endpoint} region={s3_region} bucket={bucket} path={s3_path}")
+    log(f"MODEL_FORMAT name={model_format_name} version={model_format_ver}")
 
-    # 1) Get-or-create RegisteredModel
+    # 1) RegisteredModel
     sc, txt, data = req("GET", f"{base}/registered_models")
     if sc != 200:
         fatal(f"Failed to list registered_models: {sc} {txt}")
@@ -116,9 +121,7 @@ def main():
             rm_id = it.get("id")
             break
 
-    if rm_id:
-        log(f"RegisteredModel exists id={rm_id}")
-    else:
+    if not rm_id:
         sc, txt, data = req("POST", f"{base}/registered_models", {"name": model_name, "description": "Registered by pipeline"})
         if sc not in (200, 201):
             fatal(f"Failed to create RegisteredModel: {sc} {txt}")
@@ -126,103 +129,92 @@ def main():
         if not rm_id:
             fatal(f"RegisteredModel created but id missing: {data}")
         log(f"RegisteredModel created id={rm_id}")
+    else:
+        log(f"RegisteredModel exists id={rm_id}")
 
-    rm_id_str = str(rm_id)  # <-- IMPORTANT: registry expects registeredModelId as string
+    rm_id = str(rm_id)
 
-    # 2) Create Artifact
-    sc, txt, data = req("POST", f"{base}/model_artifacts", {
-        "name": f"{model_name}:{version}",
-        "description": "Model storage reference",
-        "uri": model_uri
-    })
-    if sc not in (200, 201):
-        fatal(f"Failed to create Artifact at /model_artifacts with uri: {sc} {txt}")
-
-    artifact_id = (data or {}).get("id")
-    if not artifact_id:
-        fatal(f"Artifact created but id missing: {data}")
-    log(f"✅ Artifact created id={artifact_id}")
-
-    # 3) Create ModelVersion
-    #
-    # FIX: registeredModelId MUST be a STRING, not a number
-    #
-    version_payload = {
-        "name": version,
-        "description": f"Exported from run {version}",
-        "registeredModelId": rm_id_str,  # <-- FIX
-    }
-
-    candidates = [
-        f"{base}/model_versions",
-        f"{base}/registered_models/{rm_id_str}/versions",
-    ]
-
-    created_version = None
-    last_err = None
-
-    for url in candidates:
-        sc, txt, data = req("POST", url, version_payload)
-        log(f"TRY POST {url} payload={{name,description,registeredModelId}} -> {sc} BODY: {txt[:300]}")
-        if sc in (200, 201, 409):
-            created_version = data
-            log(f"✅ ModelVersion created/exists via {url}")
-            break
-        last_err = f"{url} -> {sc}: {txt}"
-
-    if not created_version and "-> 409" not in (last_err or ""):
-        fatal(
-            "Failed to create ModelVersion even after fixing registeredModelId type.\n"
-            f"Last error: {last_err}"
-        )
-
-    # Try to get version id from response; if missing, search it
-    mv_id = (created_version or {}).get("id")
-    if not mv_id:
-        sc, txt, data = req("GET", f"{base}/model_versions")
-        if sc == 200:
-            for it in pick_items(data):
-                if it.get("name") == version and str(it.get("registeredModelId")) == rm_id_str:
-                    mv_id = it.get("id")
-                    break
-
-    # 4) OPTIONAL: attempt to link artifact to model version (best-effort)
-    linked = False
-    if mv_id:
-        link_payloads = [
-            {"modelVersionId": int(mv_id), "modelArtifactId": int(artifact_id)},
-            {"model_version_id": int(mv_id), "model_artifact_id": int(artifact_id)},
-            {"modelVersionId": int(mv_id), "artifactId": int(artifact_id)},
-        ]
-        link_endpoints = [
-            f"{base}/model_version_artifacts",
-            f"{base}/modelversion_artifacts",
-            f"{base}/model_versions/{mv_id}/artifacts",
-            f"{base}/model_versions/{mv_id}/model_artifacts",
-        ]
-
-        for ep in link_endpoints:
-            for lp in link_payloads:
-                sc, txt, data = req("POST", ep, lp)
-                if sc in (200, 201, 409):
-                    log(f"✅ Linked artifact to version via {ep} payload_keys={list(lp.keys())}")
-                    linked = True
-                    break
-            if linked:
+    # 2) ModelVersion (minimal)
+    mv_payload = {"name": version, "description": f"Exported from run {version}", "registeredModelId": rm_id}
+    sc, txt, data = req("POST", f"{base}/model_versions", mv_payload)
+    if sc in (200, 201):
+        mv_id = str((data or {}).get("id"))
+    else:
+        # find existing
+        sc2, txt2, data2 = req("GET", f"{base}/model_versions")
+        if sc2 != 200:
+            fatal(f"Failed to create/find ModelVersion: {sc} {txt}")
+        mv_id = None
+        for it in pick_items(data2):
+            if it.get("name") == version and str(it.get("registeredModelId")) == rm_id:
+                mv_id = str(it.get("id"))
                 break
+        if not mv_id:
+            fatal(f"Failed to create/find ModelVersion: {sc} {txt}")
+    log(f"✅ ModelVersion id={mv_id}")
+
+    # 3) Create ModelArtifact (minimal create, then PATCH format if needed)
+    art_payload = {"name": f"{model_name}:{version}", "description": "Model storage reference", "uri": model_uri}
+    sc, txt, data = req("POST", f"{base}/model_artifacts", art_payload)
+    if sc not in (200, 201):
+        fatal(f"Failed to create ModelArtifact: {sc} {txt}")
+    created_aid = str((data or {}).get("id"))
+    log(f"✅ ModelArtifact created id={created_aid}")
+
+    # PATCH format (your API accepts patching these even when POST rejected extra fields)
+    sc, txt, _ = req("PATCH", f"{base}/model_artifacts/{created_aid}", {"modelFormatName": model_format_name, "modelFormatVersion": model_format_ver})
+    if sc in (200, 201):
+        log(f"✅ Patched artifact format on {created_aid}")
+    else:
+        log(f"[WARN] Could not patch artifact format on {created_aid}: {sc} {txt[:200]}")
+
+    # 4) Link ModelVersion -> Artifact
+    link_payload = {"artifactType": "ModelArtifact", "artifactId": created_aid}
+    sc, txt, data = req("POST", f"{base}/model_versions/{mv_id}/artifacts", link_payload)
+    if sc not in (200, 201, 409):
+        fatal(f"Failed linking artifact: {sc} {txt}")
+    log("✅ Linked version -> artifact (request accepted)")
+
+    # 5) IMPORTANT: Find the *actual* artifact id the version returns (your API may show a different id)
+    sc, txt, data = req("GET", f"{base}/model_versions/{mv_id}/artifacts")
+    if sc != 200:
+        fatal(f"Failed to list version artifacts: {sc} {txt}")
+
+    linked_items = pick_items(data)
+    if not linked_items:
+        fatal("No artifacts returned from /model_versions/{id}/artifacts")
+
+    # Prefer artifact with matching uri; else take first
+    linked_aid = None
+    for it in linked_items:
+        if it.get("uri") == model_uri:
+            linked_aid = str(it.get("id"))
+            break
+    if not linked_aid:
+        linked_aid = str(linked_items[0].get("id"))
+
+    log(f"Linked artifact id seen by version = {linked_aid} (created was {created_aid})")
+
+    # Ensure the linked artifact has uri + format
+    req("PATCH", f"{base}/model_artifacts/{linked_aid}", {"uri": model_uri})
+    req("PATCH", f"{base}/model_artifacts/{linked_aid}", {"modelFormatName": model_format_name, "modelFormatVersion": model_format_ver})
+
+    # Optional: try making it visible by state
+    sc, txt, _ = req("PATCH", f"{base}/model_artifacts/{linked_aid}", {"state": "LIVE"})
+    if sc not in (200, 201):
+        log(f"[INFO] Artifact state patch not supported (ok): {sc} {txt[:120]}")
 
     result = {
         "registered_model_id": rm_id,
-        "artifact_id": artifact_id,
         "model_version_id": mv_id,
-        "version": version,
+        "created_artifact_id": created_aid,
+        "linked_artifact_id": linked_aid,
         "model_uri": model_uri,
-        "artifact_linked": linked
+        "object_storage": {"endpoint": s3_endpoint, "region": s3_region, "bucket": bucket, "path": s3_path},
+        "format": {"name": model_format_name, "version": model_format_ver},
+        "note": "UI Model location may still require typed customProperties / connection payload (capture from UI Network tab)."
     }
     print(json.dumps(result, indent=2))
-
-    if not linked:
-        log("NOTE: Artifact linking not confirmed. Version is created, but registry may link artifacts differently (or auto-link via UI).")
 
 if __name__ == "__main__":
     main()
